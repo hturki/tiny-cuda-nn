@@ -138,7 +138,8 @@ __global__ void kernel_grid(
 	const float log2_per_level_scale,
 	const float quantize_threshold,
 	float max_level,
-	const float* __restrict__ max_level_gpu,
+    bool summed_features,
+    const float* __restrict__ max_level_gpu,
 	const InterpolationType interpolation_type,
 	const GridType grid_type,
 	const T* __restrict__ grid,
@@ -158,7 +159,7 @@ __global__ void kernel_grid(
 	}
 
 	if (level >= max_level + 1e-3f) {
-		if (encoded_positions) {
+		if (encoded_positions && (level == 0 || !summed_features)) {
 			#pragma unroll
 			for (uint32_t f = 0; f < N_FEATURES_PER_LEVEL; ++f) {
 				encoded_positions[i + (level * N_FEATURES_PER_LEVEL + f) * num_elements] = (T)0.0f;
@@ -207,10 +208,17 @@ __global__ void kernel_grid(
 		auto result = grid_val(pos_grid);
 
 		if (encoded_positions) {
-			#pragma unroll
-			for (uint32_t f = 0; f < N_FEATURES_PER_LEVEL; ++f) {
-				encoded_positions[i + (level * N_FEATURES_PER_LEVEL + f) * num_elements] = result[f];
-			}
+            if (!summed_features || level == 0) {
+                #pragma unroll
+                for (uint32_t f = 0; f < N_FEATURES_PER_LEVEL; ++f) {
+                    encoded_positions[i + (level * N_FEATURES_PER_LEVEL + f) * num_elements] = result[f];
+                }
+            } else {
+                #pragma unroll
+                for (uint32_t f = 0; f < N_FEATURES_PER_LEVEL; ++f) {
+                    encoded_positions[i + f * num_elements] += result[f];
+                }
+            }
 		}
 
 		// Gradient is zero when there's no interpolation.
@@ -254,10 +262,17 @@ __global__ void kernel_grid(
 			}
 		}
 
-		#pragma unroll
-		for (uint32_t f = 0; f < N_FEATURES_PER_LEVEL; ++f) {
-			encoded_positions[i + (level * N_FEATURES_PER_LEVEL + f) * num_elements] = result[f];
-		}
+        if (!summed_features || level == 0) {
+            #pragma unroll
+            for (uint32_t f = 0; f < N_FEATURES_PER_LEVEL; ++f) {
+                encoded_positions[i + (level * N_FEATURES_PER_LEVEL + f) * num_elements] = result[f];
+            }
+        } else {
+            #pragma unroll
+            for (uint32_t f = 0; f < N_FEATURES_PER_LEVEL; ++f) {
+                encoded_positions[i + f * num_elements] += result[f];
+            }
+        }
 	}
 
 	// Gradient
@@ -311,6 +326,7 @@ __global__ void kernel_grid_backward(
 	const uint32_t base_resolution,
 	const float log2_per_level_scale,
 	float max_level,
+    bool summed_features,
 	const float* __restrict__ max_level_gpu,
 	const bool stochastic_interpolation,
 	const InterpolationType interpolation_type,
@@ -382,7 +398,7 @@ __global__ void kernel_grid_backward(
 
 	#pragma unroll
 	for (uint32_t f = 0; f < N_FEATURES_PER_THREAD; ++f) {
-		grad[f] = dL_dy[i + (level * N_FEATURES_PER_LEVEL + feature + f) * num_elements];
+		grad[f] = dL_dy[i + ((summed_features ? 0 : (level * N_FEATURES_PER_LEVEL)) + feature + f) * num_elements];
 	}
 
 	if (interpolation_type == InterpolationType::Nearest) {
@@ -495,6 +511,7 @@ __global__ void kernel_grid_backward_input_backward_grid(
 	const uint32_t base_resolution,
 	const float log2_per_level_scale,
 	float max_level,
+    bool summed_features,
 	const float* __restrict__ max_level_gpu,
 	// const bool stochastic_interpolation, // TODO: is this needed?
 	const InterpolationType interpolation_type,
@@ -570,7 +587,7 @@ __global__ void kernel_grid_backward_input_backward_grid(
 
 	#pragma unroll
 	for (uint32_t f = 0; f < N_FEATURES_PER_THREAD; ++f) {
-		grad[f] = dL_dy[i + (level * N_FEATURES_PER_LEVEL + feature + f) * num_elements];
+		grad[f] = dL_dy[i + ((summed_features ? 0 : level * N_FEATURES_PER_LEVEL) + feature + f) * num_elements];
 	}
 
 	if (interpolation_type == InterpolationType::Nearest) {
@@ -619,7 +636,8 @@ __global__ void kernel_grid_backward_input_backward_input(
 	const float log2_per_level_scale,
 	const float quantize_threshold,
 	float max_level,
-	const float* __restrict__ max_level_gpu,
+    bool summed_features,
+    const float* __restrict__ max_level_gpu,
 	const InterpolationType interpolation_type,
 	const GridType grid_type,
 	// inputs
@@ -673,7 +691,7 @@ __global__ void kernel_grid_backward_input_backward_input(
 
 	#pragma unroll
 	for (uint32_t f = 0; f < N_FEATURES_PER_THREAD; ++f) {
-		grad[f] = dL_dy[i + (level * N_FEATURES_PER_LEVEL + feature + f) * num_elements];
+		grad[f] = dL_dy[i + ((summed_features ? level * N_FEATURES_PER_LEVEL : 0) + feature + f) * num_elements];
 	}
 
 	if (interpolation_type == InterpolationType::Nearest) {
@@ -871,7 +889,8 @@ public:
 		uint32_t base_resolution,
 		float per_level_scale,
 		bool stochastic_interpolation,
-		InterpolationType interpolation_type,
+        bool summed_features,
+        InterpolationType interpolation_type,
 		GridType grid_type
 	) :
 	m_n_features{n_features},
@@ -879,11 +898,16 @@ public:
 	m_base_resolution{base_resolution},
 	m_per_level_scale{per_level_scale},
 	m_stochastic_interpolation{stochastic_interpolation},
+    m_summed_features{summed_features},
 	m_interpolation_type{interpolation_type},
 	m_grid_type{grid_type}
 	{
 		m_n_levels = div_round_up(m_n_features, N_FEATURES_PER_LEVEL);
-		uint32_t offset = 0;
+        if (summed_features) {
+            m_n_features = N_FEATURES_PER_LEVEL;
+        }
+
+        uint32_t offset = 0;
 
 		m_hashmap_offsets_table_cpu.resize(m_n_levels + 1);
 
@@ -985,6 +1009,7 @@ public:
 			std::log2(m_per_level_scale),
 			this->m_quantize_threshold,
 			this->m_max_level,
+            this->m_summed_features,
 			this->m_max_level_gpu,
 			m_interpolation_type,
 			m_grid_type,
@@ -996,7 +1021,7 @@ public:
 
 		if (output && output->layout() == AoS) {
 			// Transpose result (was stored row major due to coalescing)
-			const dim3 threads_transpose = { m_n_levels * N_FEATURES_PER_LEVEL, 8, 1 };
+			const dim3 threads_transpose = { m_summed_features ? N_FEATURES_PER_LEVEL : (m_n_levels * N_FEATURES_PER_LEVEL), 8, 1 };
 			const uint32_t blocks_transpose = div_round_up(num_elements, threads_transpose.y);
 			transpose_encoded_position<T><<<blocks_transpose, threads_transpose, 0, synced_streams.get(0)>>>(
 				num_elements,
@@ -1032,7 +1057,7 @@ public:
 			workspace = allocate_workspace(stream, num_elements * m_n_features * sizeof(T));
 
 			// Transpose dL_dy. Use the buffer previously occupied by the encoded positions
-			const dim3 threads_transpose = { m_n_levels * N_FEATURES_PER_LEVEL, 8, 1 };
+			const dim3 threads_transpose = { m_summed_features ? N_FEATURES_PER_LEVEL : (m_n_levels * N_FEATURES_PER_LEVEL), 8, 1 };
 			const uint32_t blocks_transpose = div_round_up(num_elements, threads_transpose.y);
 			transpose_gradients<T><<<blocks_transpose, threads_transpose, 0, stream>>>(
 				num_elements,
@@ -1072,6 +1097,7 @@ public:
 				m_base_resolution,
 				std::log2(m_per_level_scale),
 				this->m_max_level,
+                this->m_summed_features,
 				this->m_max_level_gpu,
 				m_stochastic_interpolation,
 				m_interpolation_type,
@@ -1167,8 +1193,9 @@ public:
 				m_base_resolution,
 				std::log2(m_per_level_scale),
 				this->m_max_level,
+                this->m_summed_features,
 				this->m_max_level_gpu,
-				m_interpolation_type,
+                m_interpolation_type,
 				m_grid_type,
 				// inputs
 				dL_ddLdinput.view(),
@@ -1214,6 +1241,7 @@ public:
 				std::log2(m_per_level_scale),
 				this->m_quantize_threshold,
 				this->m_max_level,
+                this->m_summed_features,
 				this->m_max_level_gpu,
 				m_interpolation_type,
 				m_grid_type,
@@ -1339,7 +1367,9 @@ private:
 	float m_per_level_scale;
 
 	bool m_stochastic_interpolation;
-	InterpolationType m_interpolation_type;
+    bool m_summed_features;
+
+    InterpolationType m_interpolation_type;
 	GridType m_grid_type;
 
 	// Storage of params
@@ -1370,12 +1400,13 @@ GridEncoding<T>* create_grid_encoding_templated(uint32_t n_dims_to_encode, const
 	encoding.value("base_resolution", 16u), \
 	encoding.value("per_level_scale", 2.0f), \
 	encoding.value("stochastic_interpolation", false), \
-	string_to_interpolation_type(encoding.value("interpolation", "Linear")), \
+	encoding.value("summed_features", false), \
+    string_to_interpolation_type(encoding.value("interpolation", "Linear")), \
 	string_to_grid_type(encoding.value("type", default_type)), \
 
 	// If higher-dimensional hash encodings are desired, corresponding switch cases can be added
 	switch (n_dims_to_encode) {
-		// case 1: return new GridEncodingTemplated<T, 1, N_FEATURES_PER_LEVEL>{ TCNN_GRID_PARAMS };
+		 case 1: return new GridEncodingTemplated<T, 1, N_FEATURES_PER_LEVEL>{ TCNN_GRID_PARAMS };
 		case 2: return new GridEncodingTemplated<T, 2, N_FEATURES_PER_LEVEL>{ TCNN_GRID_PARAMS };
 		case 3: return new GridEncodingTemplated<T, 3, N_FEATURES_PER_LEVEL>{ TCNN_GRID_PARAMS };
 		case 4: return new GridEncodingTemplated<T, 4, N_FEATURES_PER_LEVEL>{ TCNN_GRID_PARAMS };
